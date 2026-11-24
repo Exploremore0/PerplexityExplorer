@@ -1,0 +1,258 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Perplexity Explorer</title>
+<style>
+  body {font-family: Arial, sans-serif; margin: 2rem; background:#f5f5f5;}
+  .card {background:#fff; border-radius:8px; padding:1.5rem; margin-bottom:1.5rem; box-shadow:0 2px 4px rgba(0,0,0,0.1);}
+  button {background:#5c6bc0; color:#fff; border:none; border-radius:4px; padding:0.5rem 1rem; cursor:pointer; margin:0.2rem;}
+  button:hover {background:#7e88d4;}
+  .blue {background:#5c6bc0;}
+  .purple {background:#9c27b0;}
+  .error {color:#d32f2f; font-weight:bold;}
+  table {width:100%; border-collapse:collapse; margin-top:0.5rem;}
+  th, td {border:1px solid #ddd; padding:0.4rem; text-align:left;}
+  .bar {height:1rem; background:#5c6bc0; margin:0.2rem 0;}
+  .bar.highlight {background:#9c27b0;}
+</style>
+</head>
+<body>
+  <h1>Perplexity Explorer</h1>
+
+  <!-- Section 1 – Input -->
+  <div class="card" id="section1">
+    <h2>1️⃣ Type a sentence</h2>
+    <textarea id="sentence" rows="2" style="width:100%">I love Python</textarea>
+    <div>
+      <button class="sample" data-text="I love Python">I love Python</button>
+      <button class="sample" data-text="Python love I">Python love I</button>
+      <button class="sample" data-text="The capital of France is Paris">The capital of France is Paris</button>
+    </div>
+    <br/>
+    <button id="calcBtn" class="blue">Calculate perplexity</button>
+    <p id="statusLine">Ready.</p>
+    <div id="modelError" class="error" style="display:none"></div>
+  </div>
+
+  <!-- Section 2 – Tokens & Perplexity -->
+  <div class="card" id="section2" style="display:none">
+    <h2>2️⃣ Token probabilities → perplexity</h2>
+    <table id="tokenTable">
+      <thead>
+        <tr><th>#</th><th>Token</th><th>P</th><th>1/P</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <pre id="steps"></pre>
+  </div>
+
+  <!-- Section 3 – Next‑token prediction -->
+  <div class="card" id="section3" style="display:none">
+    <h2>3️⃣ What does the model predict next?</h2>
+    <div id="nextTokens"></div>
+  </div>
+
+  <!-- Section 4 – Simulated hand‑calc -->
+  <div class="card" id="section4">
+    <h2>4️⃣ Try it by hand (simulated, not from the model)</h2>
+    <div id="manualRows">
+      <!-- rows will be inserted here -->
+    </div>
+    <button id="addRow" class="purple">+ Add token</button>
+    <br/><br/>
+    <div>
+      <button class="preset" data-preset="lovePython">I love Python (0.5, 0.8, 0.2)</button>
+      <button class="preset" data-preset="all1_8">All 1/8 (0.125 each)</button>
+      <button class="preset" data-preset="surprise">One surprising word (0.9, 0.9, 0.9, 0.01)</button>
+    </div>
+    <h3>Table (simulated)</h3>
+    <table id="simTable">
+      <thead>
+        <tr><th>#</th><th>Token</th><th>P</th><th>1/P</th></tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+    <pre id="simSteps"></pre>
+  </div>
+
+  <!-- JavaScript – everything in a module -->
+  <script type="module">
+    // Import from Transformers.js (runs in the browser).
+    import {AutoTokenizer, AutoModelForCausalLM, Tensor} from "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3";
+
+    // Global references – will be filled on first use.
+    let tokenizer = null;
+    let model = null;
+    const startTokenId = 50256; // GPT‑2 start token.
+
+    /** Load tokenizer & model only once. */
+    async function loadModel() {
+      if (tokenizer && model) return; // already loaded.
+      document.getElementById('statusLine').textContent = 'Downloading the model…';
+      try {
+        tokenizer = await AutoTokenizer.fromPretrained('Xenova/distilgpt2');
+        model = await AutoModelForCausalLM.fromPretrained('Xenova/distilgpt2', {dtype: 'q8'});
+        document.getElementById('statusLine').textContent = 'Model ready.';
+      } catch (e) {
+        console.error(e);
+        document.getElementById('modelError').textContent = '❌ Failed to load the model.';
+        document.getElementById('modelError').style.display = 'block';
+        throw e;
+      }
+    }
+
+    /** Stable softmax – returns an array of probabilities. */
+    function softmax(logits) {
+      const maxLogit = Math.max(...logits);
+      const exps = logits.map(l => Math.exp(l - maxLogit));
+      const sum = exps.reduce((a,b) => a+b, 0);
+      return exps.map(v => v / sum);
+    }
+
+    /** Compute perplexity and fill Section 2. */
+    async function calculatePerplexity() {
+      const sentence = document.getElementById('sentence').value.trim();
+      if (!sentence) return;
+      await loadModel();
+      const encoded = tokenizer.encode(sentence);
+      const ids = [startTokenId, ...encoded]; // include start marker.
+      const inputIds = new Tensor('int64', [1, ids.length], new BigInt64Array(ids.map(BigInt)));
+      // Run the model – we only need logits.
+      const outputs = await model({input_ids: inputIds});
+      const logits = outputs.logits.squeeze(0).arraySync(); // shape [seqLen, vocab]
+
+      const probs = [];
+      const logProbs = [];
+      // For each real token (skip the first start token) compute P.
+      for (let i = 1; i < ids.length; i++) {
+        const prevLogits = logits[i-1];
+        const probsAtPos = softmax(prevLogits);
+        const tokenId = ids[i];
+        const p = probsAtPos[tokenId];
+        probs.push(p);
+        logProbs.push(Math.log(p));
+      }
+
+      // Fill token table.
+      const tbody = document.querySelector('#tokenTable tbody');
+      tbody.innerHTML = '';
+      ids.slice(1).forEach((id, idx) => {
+        const tokenStr = tokenizer.decode([id]).replace(/ /g, '␣');
+        const p = probs[idx];
+        const row = `<tr><td>${idx+1}</td><td>${tokenStr}</td><td>${p.toFixed(5)}</td><td>${(1/p).toFixed(2)}</td></tr>`;
+        tbody.insertAdjacentHTML('beforeend', row);
+      });
+
+      // Compute perplexity using log‑prob average.
+      const avgNegLog = -logProbs.reduce((a,b)=>a+b,0) / logProbs.length;
+      const perplexity = Math.exp(avgNegLog);
+
+      // Show steps.
+      const steps = [];
+      const mult = probs.map(p=>1/p).reduce((a,b)=>a*b,1);
+      steps.push(`Step 1: multiply all 1/P → ${mult.toExponential(3)}`);
+      steps.push(`Step 2: N = ${probs.length}`);
+      steps.push(`Step 3: Perplexity = (${mult.toExponential(3)})^(1/${probs.length}) = ${perplexity.toFixed(3)}`);
+      document.getElementById('steps').textContent = steps.join('\n');
+
+      // Show Section 2 & 3.
+      document.getElementById('section2').style.display = 'block';
+      showNextTokens(logits[logits.length-1]);
+    }
+
+    /** Show top‑8 next‑token distribution as bars. */
+    function showNextTokens(lastLogits) {
+      const probs = softmax(lastLogits);
+      const topIndices = probs.map((p,i)=>[p,i])
+                           .sort((a,b)=>b[0]-a[0])
+                           .slice(0,8);
+      const container = document.getElementById('nextTokens');
+      container.innerHTML = '';
+      topIndices.forEach(([p, idx], i) => {
+        const token = tokenizer.decode([idx]).replace(/ /g, '␣');
+        const percent = (p*100).toFixed(1);
+        const bar = `<div style="width:${percent}%" class="bar${i===0?' highlight':''}"></div>`;
+        container.insertAdjacentHTML('beforeend', `<div>${token} – ${percent}%${bar}</div>`);
+      });
+      document.getElementById('section3').style.display = 'block';
+    }
+
+    // ----- UI wiring -----
+    document.getElementById('calcBtn').addEventListener('click', () => {
+      calculatePerplexity().catch(()=>{});
+    });
+
+    document.querySelectorAll('.sample').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.getElementById('sentence').value = btn.dataset.text;
+      });
+    });
+
+    // ---- Section 4 (manual) ----
+    function addManualRow(token='', prob='') {
+      const row = document.createElement('div');
+      row.innerHTML = `Token: <input class="tok" value="${token}" size="8"/> `+
+                      `Prob: <input class="pr" type="number" step="0.001" min="0" max="1" value="${prob}"/> `+
+                      `<button class="remove">Remove</button>`;
+      row.querySelector('.remove').addEventListener('click', () => row.remove());
+      document.getElementById('manualRows').appendChild(row);
+    }
+    document.getElementById('addRow').addEventListener('click', () => addManualRow());
+
+    function updateSimulated() {
+      const rows = document.querySelectorAll('#manualRows div');
+      const probs = [];
+      const tokens = [];
+      rows.forEach(r => {
+        const t = r.querySelector('.tok').value.trim() || '(?)';
+        const p = parseFloat(r.querySelector('.pr').value);
+        if (!isNaN(p) && p>0) {tokens.push(t); probs.push(p);} // ignore invalid
+      });
+      // Fill simulated table.
+      const tbody = document.querySelector('#simTable tbody');
+      tbody.innerHTML = '';
+      probs.forEach((p,i) => {
+        const row = `<tr><td>${i+1}</td><td>${tokens[i]}</td><td>${p.toFixed(5)}</td><td>${(1/p).toFixed(2)}</td></tr>`;
+        tbody.insertAdjacentHTML('beforeend', row);
+      });
+      // Steps.
+      if (probs.length) {
+        const mult = probs.map(p=>1/p).reduce((a,b)=>a*b,1);
+        const avgNegLog = -probs.map(p=>Math.log(p)).reduce((a,b)=>a+b,0)/probs.length;
+        const perplex = Math.exp(avgNegLog);
+        const steps = [];
+        steps.push(`Step 1: multiply all 1/P → ${mult.toExponential(3)}`);
+        steps.push(`Step 2: N = ${probs.length}`);
+        steps.push(`Step 3: Perplexity = (${mult.toExponential(3)})^(1/${probs.length}) = ${perplex.toFixed(3)}`);
+        document.getElementById('simSteps').textContent = steps.join('\n');
+      } else {
+        document.getElementById('simSteps').textContent = '';
+      }
+    }
+
+    // Re‑compute when any manual input changes.
+    document.getElementById('manualRows').addEventListener('input', updateSimulated);
+
+    // Preset buttons – fill with example probabilities.
+    const presets = {
+      lovePython: {tokens:['I','love','Python'], probs:[0.5,0.8,0.2]},
+      all1_8:    {tokens:['T1','T2','T3','T4','T5','T6','T7','T8'], probs:Array(8).fill(0.125)},
+      surprise:  {tokens:['Wow','Amazing','Incredible','Oops'], probs:[0.9,0.9,0.9,0.01]},
+    };
+    document.querySelectorAll('.preset').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const key = btn.dataset.preset;
+        const preset = presets[key];
+        // clear rows
+        document.getElementById('manualRows').innerHTML = '';
+        preset.tokens.forEach((tk,i) => addManualRow(tk, preset.probs[i]));
+        updateSimulated();
+      });
+    });
+
+    // Initialise with default sample rows (empty).
+    addManualRow();
+  </script>
+</body>
+</html>
